@@ -15,6 +15,10 @@ pub struct ProxyConfig {
     pub cfproxy_worker_domains: Vec<String>,
     pub fake_tls_domain: String,
     pub proxy_protocol: bool,
+    pub log_file: Option<String>,
+    pub log_max_mb: u64,
+    pub log_backups: usize,
+    pub autostart: bool,
 }
 
 impl Default for ProxyConfig {
@@ -34,6 +38,10 @@ impl Default for ProxyConfig {
             cfproxy_worker_domains: vec![],
             fake_tls_domain: String::new(),
             proxy_protocol: false,
+            log_file: None,
+            log_max_mb: 5,
+            log_backups: 0,
+            autostart: false,
         }
     }
 }
@@ -81,4 +89,42 @@ pub fn coerce_domain_list(value: Option<&[String]>) -> Vec<String> {
         }
     }
     result
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ConfigFile {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub secret: Option<String>,
+    pub fake_tls_domain: Option<String>,
+    pub proxy_protocol: Option<bool>,
+    pub no_cfproxy: Option<bool>,
+    pub pool_size: Option<usize>,
+    pub buf_kb: Option<usize>,
+    pub cfproxy_domain: Option<Vec<String>>,
+    pub cfproxy_worker_domain: Option<Vec<String>>,
+    pub dc_ip: Option<HashMap<u32, String>>,
+    pub log_file: Option<String>,
+    pub log_max_mb: Option<u64>,
+    pub log_backups: Option<usize>,
+    pub autostart: Option<bool>,
+}
+
+pub fn default_config_path() -> String {
+    if let Some(path) = std::env::current_exe().ok()
+        && let Some(dir) = path.parent()
+    {
+        return dir.join("config.toml").to_string_lossy().to_string();
+    }
+    "config.toml".into()
+}
+
+pub fn load_config(path: &str) -> Result<ConfigFile, String> {
+    let content = std::fs::read_to_string(path).map_err(|e| format!("Cannot read config: {e}"))?;
+    toml::from_str(&content).map_err(|e| format!("Invalid config: {e}"))
+}
+
+pub fn save_config(path: &str, cfg: &ConfigFile) -> Result<(), String> {
+    let content = toml::to_string_pretty(cfg).map_err(|e| format!("Serialize config: {e}"))?;
+    std::fs::write(path, content).map_err(|e| format!("Write config: {e}"))
 }

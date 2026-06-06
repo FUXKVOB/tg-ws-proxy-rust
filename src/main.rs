@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use cipher::StreamCipher;
 use tg_ws_proxy::proxy::balancer::BALANCER;
 use tg_ws_proxy::proxy::bridge::bridge_ws_reencrypt_halves;
-use tg_ws_proxy::proxy::config::{self, PROXY_CONFIG};
+use tg_ws_proxy::proxy::config::{self, ConfigFile, PROXY_CONFIG};
 use tg_ws_proxy::proxy::fake_tls::{build_server_hello, verify_client_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE};
 use tg_ws_proxy::proxy::handshake::{
     build_crypto_ctx, generate_relay_init, try_handshake, CryptoContext, MsgSplitter,
@@ -43,6 +43,9 @@ fn ws_blacklist() -> &'static std::sync::RwLock<HashSet<String>> {
 #[derive(Parser)]
 #[command(name = "tg-ws-proxy", about = "Telegram MTProto WebSocket Bridge Proxy")]
 struct Cli {
+    #[arg(long)]
+    config: Option<String>,
+
     #[arg(long, default_value = "1443")]
     port: u16,
 
@@ -60,6 +63,12 @@ struct Cli {
 
     #[arg(long)]
     log_file: Option<String>,
+
+    #[arg(long = "log-max-mb", default_value = "5")]
+    log_max_mb: u64,
+
+    #[arg(long = "log-backups", default_value = "0")]
+    log_backups: usize,
 
     #[arg(long = "buf-kb", default_value = "256")]
     buf_kb: usize,
@@ -81,33 +90,126 @@ struct Cli {
 
     #[arg(long = "proxy-protocol")]
     proxy_protocol: bool,
+
+    #[arg(long)]
+    autostart: bool,
+}
+
+#[cfg(windows)]
+fn ensure_single_instance() {
+    use std::net::TcpListener;
+    let _lock = Box::leak(Box::new(
+        TcpListener::bind("127.0.0.1:18923")
+            .expect("Another instance is already running. Exiting.")
+    ));
+}
+
+#[cfg(windows)]
+fn set_autostart(enable: bool) {
+    use windows_sys::Win32::System::Registry::*;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let key_path: Vec<u16> = OsStr::new(r"Software\Microsoft\Windows\CurrentVersion\Run")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let app_name: Vec<u16> = OsStr::new("TG WS Proxy")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        let mut hkey = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, key_path.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) == 0 {
+            if enable {
+                if let Ok(exe) = std::env::current_exe() {
+                    let path: Vec<u16> = exe.as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    RegSetValueExW(hkey, app_name.as_ptr(), 0, REG_SZ,
+                        path.as_ptr() as *const u8, (path.len() * 2) as u32);
+                }
+            } else {
+                RegDeleteValueW(hkey, app_name.as_ptr());
+            }
+            RegCloseKey(hkey);
+        }
+    }
+}
+
+fn first_run_marker_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    dir.join(".first_run_done")
 }
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Cli::parse();
+
+    let (cfg_file, config_path) = if let Some(ref path) = args.config {
+        let path = if path.is_empty() { config::default_config_path() } else { path.clone() };
+        (config::load_config(&path).ok(), Some(path))
+    } else {
+        (None, Some(config::default_config_path()))
+    };
+
+    let log_file = args.log_file.clone()
+        .or_else(|| cfg_file.as_ref().and_then(|c| c.log_file.clone()));
+
+    if let Some(ref path) = log_file {
+        let file_appender = tracing_appender::rolling::never(
+            std::path::Path::new(path).parent().unwrap_or(std::path::Path::new(".")),
+            std::path::Path::new(path).file_name().unwrap().to_string_lossy().as_ref(),
+        );
+        let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_writer(non_blocking)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     if args.verbose {
         unsafe { std::env::set_var("RUST_LOG", "debug"); }
     }
 
-    let dc_redirects = if args.dc_ip.is_empty() {
-        HashMap::from([
-            (2u32, "149.154.167.220".to_string()),
-            (4u32, "149.154.167.220".to_string()),
-        ])
-    } else {
+    #[cfg(windows)]
+    ensure_single_instance();
+
+    let log_max_mb = args.log_max_mb;
+    let log_backups = args.log_backups;
+
+    let cfg = cfg_file.unwrap_or(ConfigFile {
+        host: None, port: None, secret: None, fake_tls_domain: None,
+        proxy_protocol: None, no_cfproxy: None, pool_size: None, buf_kb: None,
+        cfproxy_domain: None, cfproxy_worker_domain: None, dc_ip: None,
+        log_file: None, log_max_mb: None, log_backups: None, autostart: None,
+    });
+
+    let dc_redirects = if !args.dc_ip.is_empty() {
         config::parse_dc_ip_list(&args.dc_ip).unwrap_or_else(|e| {
             error!("{}", e);
             std::process::exit(1);
         })
+    } else if let Some(ref dc_map) = cfg.dc_ip {
+        dc_map.clone()
+    } else {
+        HashMap::from([
+            (2u32, "149.154.167.220".to_string()),
+            (4u32, "149.154.167.220".to_string()),
+        ])
     };
 
     let secret_hex = if let Some(s) = &args.secret {
@@ -120,6 +222,8 @@ async fn main() {
             std::process::exit(1);
         }
         s.clone()
+    } else if let Some(ref s) = cfg.secret {
+        s.clone()
     } else {
         let secret: String = (0..32)
             .map(|_| {
@@ -131,71 +235,106 @@ async fn main() {
         secret
     };
 
+    let host = if args.host != "127.0.0.1" { args.host.clone() } else { cfg.host.clone().unwrap_or_else(|| args.host.clone()) };
+    let port = args.port != 1443 || cfg.port.unwrap_or(1443) == 1443;
+    let port_val = if !port { cfg.port.unwrap_or(1443) } else { args.port };
+
+    let fake_tls_domain = if !args.fake_tls_domain.is_empty() {
+        args.fake_tls_domain.clone()
+    } else {
+        cfg.fake_tls_domain.clone().unwrap_or_default()
+    };
+
+    let proxy_protocol = args.proxy_protocol || cfg.proxy_protocol.unwrap_or(false);
+    let no_cfproxy = args.no_cfproxy || cfg.no_cfproxy.unwrap_or(false);
+    let pool_size = if args.pool_size != 4 { args.pool_size } else { cfg.pool_size.unwrap_or(4) };
+    let buf_kb = if args.buf_kb != 256 { args.buf_kb } else { cfg.buf_kb.unwrap_or(256) };
+
+    let autostart = args.autostart || cfg.autostart.unwrap_or(false);
+    #[cfg(windows)]
+    set_autostart(autostart);
+
     {
-        let mut cfg = PROXY_CONFIG.write().unwrap();
-        cfg.port = args.port;
-        cfg.host = args.host.clone();
-        cfg.secret = secret_hex.clone();
-        cfg.dc_redirects = dc_redirects.clone();
-        cfg.buffer_size = args.buf_kb.max(4) * 1024;
-        cfg.pool_size = args.pool_size;
-        cfg.fallback_cfproxy = !args.no_cfproxy;
-        cfg.cfproxy_user_domains = config::coerce_domain_list(Some(&args.cfproxy_domain));
-        cfg.cfproxy_worker_domains = config::coerce_domain_list(Some(&args.cfproxy_worker_domain));
-        cfg.fake_tls_domain = args.fake_tls_domain.clone();
-        cfg.proxy_protocol = args.proxy_protocol;
+        let mut pc = PROXY_CONFIG.write().unwrap();
+        pc.port = port_val;
+        pc.host = host.clone();
+        pc.secret = secret_hex.clone();
+        pc.dc_redirects = dc_redirects.clone();
+        pc.buffer_size = buf_kb.max(4) * 1024;
+        pc.pool_size = pool_size;
+        pc.fallback_cfproxy = !no_cfproxy;
+        pc.cfproxy_user_domains = config::coerce_domain_list(
+            if !args.cfproxy_domain.is_empty() { Some(&args.cfproxy_domain) } else { cfg.cfproxy_domain.as_deref() }
+        );
+        pc.cfproxy_worker_domains = config::coerce_domain_list(
+            if !args.cfproxy_worker_domain.is_empty() { Some(&args.cfproxy_worker_domain) } else { cfg.cfproxy_worker_domain.as_deref() }
+        );
+        pc.fake_tls_domain = fake_tls_domain.clone();
+        pc.proxy_protocol = proxy_protocol;
+        pc.log_file = log_file.clone();
+        pc.log_max_mb = log_max_mb;
+        pc.log_backups = log_backups;
+        pc.autostart = autostart;
     }
 
     let secret_bytes = hex::decode(&secret_hex).expect("invalid hex");
-    let link_host = get_link_host(&args.host);
+    let link_host = get_link_host(&host);
 
     info!("{}", "=".repeat(60));
     info!("  Telegram MTProto WS Bridge Proxy");
-    info!("  Listening on   {}:{}", args.host, args.port);
+    info!("  Listening on   {}:{}", host, port_val);
     info!("  Secret:        {}", secret_hex);
-    if !args.fake_tls_domain.is_empty() {
-        info!("  Fake TLS:      {}", args.fake_tls_domain);
+    if !fake_tls_domain.is_empty() {
+        info!("  Fake TLS:      {}", fake_tls_domain);
     }
     info!("  Target DC IPs:");
     for (dc, ip) in &dc_redirects {
         info!("    DC{}: {}", dc, ip);
     }
-    if !args.no_cfproxy {
-        let user = if args.cfproxy_domain.is_empty() {
-            "auto"
-        } else {
-            "user"
-        };
-        info!("  CF proxy:      enabled ({})", user);
-    }
-    if !args.cfproxy_worker_domain.is_empty() {
-        info!(
-            "  CF worker:     enabled ({})",
-            args.cfproxy_worker_domain.join(", ")
-        );
+    if !no_cfproxy {
+        info!("  CF proxy:      enabled");
     }
     info!("{}", "=".repeat(60));
-    if let Some(host) = &link_host {
+    if let Some(ref host) = link_host {
         let dd_link = format!(
             "tg://proxy?server={}&port={}&secret=dd{}",
-            host, args.port, secret_hex
+            host, port_val, secret_hex
         );
         info!("  Connect (dd):  {}", dd_link);
-        if !args.fake_tls_domain.is_empty() {
-            let domain_hex = hex::encode(args.fake_tls_domain.as_bytes());
+        if !fake_tls_domain.is_empty() {
+            let domain_hex = hex::encode(fake_tls_domain.as_bytes());
             let ee_link = format!(
                 "tg://proxy?server={}&port={}&secret=ee{}{}",
-                host, args.port, secret_hex, domain_hex
+                host, port_val, secret_hex, domain_hex
             );
             info!("  Connect (ee):  {}", ee_link);
         }
     }
     info!("{}", "=".repeat(60));
 
-    start_proxy(secret_bytes, args).await;
+    let first_run = !first_run_marker_path().exists();
+    if first_run {
+        let _ = std::fs::write(first_run_marker_path(), "");
+        info!("First run detected, showing welcome wizard");
+    }
+
+    let gui_state = std::sync::Arc::new(parking_lot::Mutex::new(
+        tg_ws_proxy::ui::GuiState {
+            link_host: link_host.clone().unwrap_or_default(),
+            link_port: port_val,
+            link_secret: secret_hex.clone(),
+            link_domain_hex: if fake_tls_domain.is_empty() { String::new() } else { hex::encode(fake_tls_domain.as_bytes()) },
+            log_path: log_file.clone(),
+            config_path: config_path.clone().unwrap_or_default(),
+            wizard_open: first_run,
+            ..Default::default()
+        },
+    ));
+
+    start_proxy(secret_bytes, gui_state).await;
 }
 
-async fn start_proxy(secret: Vec<u8>, _args: Cli) {
+async fn start_proxy(secret: Vec<u8>, gui_state: std::sync::Arc<parking_lot::Mutex<tg_ws_proxy::ui::GuiState>>) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(async move {
@@ -213,9 +352,6 @@ async fn start_proxy(secret: Vec<u8>, _args: Cli) {
         .await
         .expect("Failed to bind");
 
-    let gui_state = std::sync::Arc::new(parking_lot::Mutex::new(
-        tg_ws_proxy::ui::GuiState::default(),
-    ));
     tg_ws_proxy::ui::start_tray(shutdown_rx.clone(), gui_state);
 
     WS_POOL.warmup().await;
@@ -400,17 +536,10 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         PROTO_PADDED_INTERMEDIATE_INT
     };
 
-    let dc_idx = if is_media {
-        -(dc as i16)
-    } else {
-        dc as i16
-    };
+    let dc_idx = if is_media { -(dc as i16) } else { dc as i16 };
     debug!(
         "[{}] handshake ok: DC{}{} proto=0x{:08X}",
-        label,
-        dc,
-        if is_media { " media" } else { "" },
-        proto_int
+        label, dc, if is_media { " media" } else { "" }, proto_int
     );
 
     let relay_init = generate_relay_init(&proto_tag, dc_idx);
@@ -466,13 +595,8 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         for domain in &domains {
             info!("[{}] DC{} -> wss://{}/apiws via {}", label, dc, domain, target);
             match RawWebSocket::connect(
-                &target,
-                domain,
-                Duration::from_secs_f64(ws_timeout),
-                "/apiws",
-            )
-            .await
-            {
+                &target, domain, Duration::from_secs_f64(ws_timeout), "/apiws",
+            ).await {
                 Ok(w) => {
                     ws = Some(w);
                     all_redirects = false;

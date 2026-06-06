@@ -3988,6 +3988,7 @@ version = "1.7.2"
 dependencies = [
  "aes",
  "anyhow",
+ "arboard",
  "base64",
  "chrono",
  "cipher",
@@ -4018,6 +4019,8 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "url",
+ "webbrowser",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
