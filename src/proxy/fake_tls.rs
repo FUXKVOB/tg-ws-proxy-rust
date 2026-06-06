@@ -26,8 +26,6 @@ const TLS_APPDATA_MAX: usize = 16384;
 
 const CCS_FRAME: [u8; 6] = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
 
-/// Verify TLS ClientHello with Fake TLS (ee-secret) protocol.
-/// Returns (client_random, session_id, timestamp) on success.
 pub fn verify_client_hello(
     data: &[u8],
     secret: &[u8],
@@ -82,35 +80,30 @@ pub fn verify_client_hello(
     Some((client_random, session_id, timestamp))
 }
 
-/// Build ServerHello response for Fake TLS.
 pub fn build_server_hello(
     secret: &[u8],
     client_random: &[u8; 32],
     session_id: &[u8; 32],
 ) -> Vec<u8> {
-    // Template: TLS 1.3 ServerHello
     let mut sh = vec![
-        0x16, 0x03, 0x03, 0x00, 0x7a, // record header
-        0x02, 0x00, 0x00, 0x76, // handshake type + length
-        0x03, 0x03, // version
+        0x16, 0x03, 0x03, 0x00, 0x7a,
+        0x02, 0x00, 0x00, 0x76,
+        0x03, 0x03,
     ];
-    // random placeholder (32 bytes)
     sh.extend_from_slice(&[0u8; 32]);
-    sh.push(0x20); // session_id length
-    sh.extend_from_slice(session_id); // 32 bytes
+    sh.push(0x20);
+    sh.extend_from_slice(session_id);
     sh.extend_from_slice(&[
-        0x13, 0x01, 0x00, // cipher suite
-        0x00, 0x2e, // extensions length
-        0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20, // key_share
+        0x13, 0x01, 0x00,
+        0x00, 0x2e,
+        0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20,
     ]);
-    // public key placeholder (32 bytes)
     sh.extend_from_slice(&[0u8; 32]);
-    sh.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]); // supported_versions
+    sh.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
 
     let sh_random_off = 11;
     let sh_pubkey_off = 89;
 
-    // fill random public key
     let pubkey: [u8; 32] = rand::random();
     sh[sh_pubkey_off..sh_pubkey_off + 32].copy_from_slice(&pubkey);
 
@@ -125,7 +118,6 @@ pub fn build_server_hello(
     response.extend_from_slice(&(encrypted_size as u16).to_be_bytes());
     response.extend_from_slice(&encrypted_data);
 
-    // HMAC the response with client_random to compute server_random
     let mut mac = HmacSha256::new_from_slice(secret).unwrap();
     mac.update(client_random);
     mac.update(&response);
@@ -136,7 +128,6 @@ pub fn build_server_hello(
     final_response
 }
 
-/// Wrap data in TLS application data records.
 pub fn wrap_tls_record(data: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(data.len() + data.len() / TLS_APPDATA_MAX * 5 + 5);
     for chunk in data.chunks(TLS_APPDATA_MAX) {
@@ -149,7 +140,6 @@ pub fn wrap_tls_record(data: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Proxy connection to masking domain (when Fake TLS verification fails).
 pub async fn proxy_to_masking_domain(
     mut client_reader: tokio::io::ReadHalf<TcpStream>,
     mut client_writer: tokio::io::WriteHalf<TcpStream>,
@@ -204,10 +194,6 @@ async fn relay(
     }
 }
 
-/// Wraps a stream to transparently encode/decode TLS Application Data records.
-///
-/// Reading: strips 5-byte record headers (type 0x17 = AppData), returns raw payload.
-/// Writing: wraps data in AppData records before passing to the inner writer.
 pub struct FakeTlsStream<R, W> {
     reader: R,
     writer: W,

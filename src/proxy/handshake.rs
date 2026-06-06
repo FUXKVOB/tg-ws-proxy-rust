@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use crate::proxy::crypto::*;
 use crate::proxy::utils::*;
 
-/// Decrypt and parse the client's 64-byte obfuscated handshake.
 pub fn try_handshake(
     handshake: &[u8],
     secret: &[u8],
@@ -49,7 +48,6 @@ pub fn try_handshake(
     Some((dc_id, is_media, proto_tag, result))
 }
 
-/// Generate the 64-byte relay initialization (obfuscated handshake to send to Telegram).
 pub fn generate_relay_init(proto_tag: &[u8; 4], dc_idx: i16) -> Vec<u8> {
     loop {
         let mut rnd = [0u8; HANDSHAKE_LEN];
@@ -95,7 +93,6 @@ pub fn generate_relay_init(proto_tag: &[u8; 4], dc_idx: i16) -> Vec<u8> {
     }
 }
 
-/// Build crypto context from client handshake and relay init.
 pub fn build_crypto_ctx(
     client_dec_prekey_iv: &[u8; 48],
     secret: &[u8],
@@ -153,7 +150,6 @@ pub struct CryptoContext {
     pub tg_dec: AesCtr,
 }
 
-/// MTProto message splitter for framed transport protocols.
 pub struct MsgSplitter {
     dec: AesCtr,
     proto: u32,

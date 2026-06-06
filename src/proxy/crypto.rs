@@ -8,7 +8,6 @@ pub fn aes_ctr_new(key: &[u8], iv: &[u8]) -> AesCtr {
     AesCtr::new_from_slices(key, iv).expect("Invalid AES key/IV length")
 }
 
-/// XOR-based mask for WebSocket framing (RFC 6455)
 pub fn xor_mask(data: &[u8], mask: &[u8; 4]) -> Vec<u8> {
     data.iter()
         .enumerate()

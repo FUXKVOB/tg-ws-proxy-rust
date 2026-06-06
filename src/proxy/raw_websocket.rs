@@ -57,7 +57,6 @@ impl RawWebSocket {
         let (reader, writer) = tokio::io::split(tls_stream);
         let mut reader = BufReader::new(reader);
 
-        // WebSocket handshake
         let ws_key = {
             let mut bytes = [0u8; 16];
             rand::rng().fill_bytes(&mut bytes);

@@ -8,8 +8,6 @@ use crate::proxy::handshake::{CryptoContext, MsgSplitter};
 use crate::proxy::raw_websocket::RawWebSocket;
 use crate::proxy::STATS;
 
-/// Bridge TCP ↔ WS with re-encryption via select! loop.
-/// Generic over client side R: AsyncRead, W: AsyncWrite (supports FakeTlsStream).
 pub async fn bridge_ws_reencrypt_halves<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
     mut writer: W,
@@ -64,7 +62,6 @@ pub async fn bridge_ws_reencrypt_halves<R: AsyncRead + Unpin, W: AsyncWrite + Un
     ws.close().await;
 }
 
-/// TCP ↔ TCP fallback bridge with re-encryption via select! loop.
 pub async fn bridge_tcp_reencrypt(
     mut client: TcpStream,
     mut remote: TcpStream,
@@ -114,7 +111,6 @@ pub async fn bridge_tcp_reencrypt(
     let _ = rw.shutdown().await;
 }
 
-/// Full TCP ↔ WS bridge (takes ownership of TcpStream).
 pub async fn bridge_ws_reencrypt(
     tcp: TcpStream,
     ws: &mut RawWebSocket,

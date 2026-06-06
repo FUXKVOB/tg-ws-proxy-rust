@@ -198,7 +198,6 @@ async fn main() {
 async fn start_proxy(secret: Vec<u8>, _args: Cli) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Handle Ctrl+C
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("Shutdown signal received, draining connections...");
@@ -214,7 +213,6 @@ async fn start_proxy(secret: Vec<u8>, _args: Cli) {
         .await
         .expect("Failed to bind");
 
-    // Start tray icon (non-blocking, runs in background thread)
     let gui_state = std::sync::Arc::new(parking_lot::Mutex::new(
         tg_ws_proxy::ui::GuiState::default(),
     ));
@@ -247,7 +245,6 @@ async fn start_proxy(secret: Vec<u8>, _args: Cli) {
         }
     });
 
-    // CF domain auto-refresh
     let _domain_refresh = tokio::spawn({
         let mut shutdown = shutdown_rx.clone();
         async move {
@@ -273,7 +270,6 @@ async fn start_proxy(secret: Vec<u8>, _args: Cli) {
                     Ok((stream, peer)) => {
                         STATS.connections_total.fetch_add(1, Ordering::Relaxed);
                         STATS.connections_active.fetch_add(1, Ordering::Relaxed);
-                        // Socket buffer sizing skipped (not available on tokio::TcpStream)
                         let secret = secret.clone();
                         tokio::spawn(async move {
                             let label = format!("{}:{}", peer.ip(), peer.port());
@@ -296,7 +292,6 @@ async fn start_proxy(secret: Vec<u8>, _args: Cli) {
 async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    // PROXY protocol v1
     let proxy_protocol = PROXY_CONFIG.read().expect("config poisoned").proxy_protocol;
     if proxy_protocol {
         let mut proxy_line = String::new();
@@ -423,7 +418,6 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
 
     let dc_key = format!("{}{}", dc, if is_media { "m" } else { "" });
 
-    // Check config
     let dc_in_config = {
         let cfg = PROXY_CONFIG.read().expect("config poisoned");
         cfg.dc_redirects.contains_key(&dc)
@@ -441,7 +435,6 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         return;
     }
 
-    // Try WebSocket / CF fallback chain
     let now = Instant::now();
     let fail_until = dc_fail_until()
         .read()
@@ -533,7 +526,6 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
     bridge_ws_reencrypt_halves(clt_reader, clt_writer, &mut ws, &mut ctx, &mut Some(splitter)).await;
 }
 
-/// Fetch CF proxy domains from GitHub and update the balancer.
 async fn refresh_cf_domains() {
     let url = "https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube/main/domains.txt";
     match reqwest::get(url).await {
@@ -555,7 +547,6 @@ async fn refresh_cf_domains() {
     }
 }
 
-/// Fallback via CF Worker → CF proxy → TCP
 async fn do_fallback_tcp_ws(
     mut reader: Box<dyn AsyncRead + Unpin + Send>,
     mut writer: Box<dyn AsyncWrite + Unpin + Send>,
@@ -573,7 +564,6 @@ async fn do_fallback_tcp_ws(
         }
     };
 
-    // 1. Try CF Worker pool
     let cfg_workers = PROXY_CONFIG.read().expect("config poisoned").cfproxy_worker_domains.clone();
     if !cfg_workers.is_empty() {
         for worker_domain in &cfg_workers {
@@ -588,7 +578,6 @@ async fn do_fallback_tcp_ws(
         }
     }
 
-    // 2. Try CF proxy via balancer
     let use_cfproxy = PROXY_CONFIG.read().expect("config poisoned").fallback_cfproxy;
     if use_cfproxy {
         let domains = {
@@ -609,7 +598,6 @@ async fn do_fallback_tcp_ws(
         }
     }
 
-    // 3. Raw TCP fallback
     info!("[{}] DC{} -> TCP fallback to {}:443", label, dc, dst);
     let up = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((dst.as_str(), 443))).await;
 
