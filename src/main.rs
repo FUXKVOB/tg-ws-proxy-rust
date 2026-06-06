@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use cipher::StreamCipher;
 use tg_ws_proxy::proxy::balancer::BALANCER;
-use tg_ws_proxy::proxy::bridge::bridge_ws_reencrypt_halves;
+use tg_ws_proxy::proxy::bridge::{bridge_ws_reencrypt_halves, SessionStats};
 use tg_ws_proxy::proxy::config::{self, ConfigFile, PROXY_CONFIG};
 use tg_ws_proxy::proxy::fake_tls::{build_server_hello, verify_client_hello, FakeTlsStream, TLS_RECORD_HANDSHAKE};
 use tg_ws_proxy::proxy::handshake::{
@@ -20,6 +20,7 @@ use tg_ws_proxy::proxy::handshake::{
 use tg_ws_proxy::proxy::pool::{CF_WORKER_POOL, WS_POOL};
 use tg_ws_proxy::proxy::raw_websocket::{RawWebSocket, WsHandshakeError};
 use tg_ws_proxy::proxy::utils::*;
+use tg_ws_proxy::proxy::stats::human_bytes;
 use tg_ws_proxy::proxy::STATS;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -137,6 +138,13 @@ fn set_autostart(enable: bool) {
             RegCloseKey(hkey);
         }
     }
+}
+
+fn check_ipv6() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &"[::1]:1".parse().unwrap(),
+        Duration::from_millis(100),
+    ).is_ok()
 }
 
 fn first_run_marker_path() -> std::path::PathBuf {
@@ -318,6 +326,10 @@ async fn main() {
         info!("First run detected, showing welcome wizard");
     }
 
+    if check_ipv6() {
+        info!("IPv6 detected — WebSocket connections may not work over IPv6");
+    }
+
     let gui_state = std::sync::Arc::new(parking_lot::Mutex::new(
         tg_ws_proxy::ui::GuiState {
             link_host: link_host.clone().unwrap_or_default(),
@@ -327,6 +339,7 @@ async fn main() {
             log_path: log_file.clone(),
             config_path: config_path.clone().unwrap_or_default(),
             wizard_open: first_run,
+            version: "1.7.2".into(),
             ..Default::default()
         },
     ));
@@ -410,9 +423,12 @@ async fn start_proxy(secret: Vec<u8>, gui_state: std::sync::Arc<parking_lot::Mut
                         tokio::spawn(async move {
                             let label = format!("{}:{}", peer.ip(), peer.port());
                             let start = Instant::now();
-                            handle_client(stream, &secret, &label).await;
+                            let s = handle_client(stream, &secret, &label).await;
                             let elapsed = start.elapsed();
-                            info!("[{}] disconnected after {:.1}s", label, elapsed.as_secs_f64());
+                            let up_str = human_bytes(s.bytes_up);
+                            let down_str = human_bytes(s.bytes_down);
+                            info!("[{}] disconnected ^ {} ({} pkts) v {} ({} pkts) in {:.1}s",
+                                label, up_str, s.packets_up, down_str, s.packets_down, elapsed.as_secs_f64());
                             STATS.connections_active.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
@@ -425,7 +441,7 @@ async fn start_proxy(secret: Vec<u8>, gui_state: std::sync::Arc<parking_lot::Mut
     }
 }
 
-async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
+async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) -> SessionStats {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
     let proxy_protocol = PROXY_CONFIG.read().expect("config poisoned").proxy_protocol;
@@ -433,7 +449,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         let mut proxy_line = String::new();
         let mut buf = [0u8; 1];
         loop {
-            if reader.read_exact(&mut buf).await.is_err() { return; }
+            if reader.read_exact(&mut buf).await.is_err() { return SessionStats::new(); }
             if buf[0] == b'\r' { continue; }
             if buf[0] == b'\n' { break; }
             proxy_line.push(buf[0] as char);
@@ -448,7 +464,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
 
     let mut first_byte = [0u8; 1];
     if tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut first_byte)).await.is_err() {
-        return;
+        return SessionStats::new();
     }
 
     let handshake;
@@ -457,12 +473,12 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
     if first_byte[0] == TLS_RECORD_HANDSHAKE && !masking.is_empty() {
         let mut hdr_rest = [0u8; 4];
         if tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut hdr_rest)).await.is_err() {
-            return;
+            return SessionStats::new();
         }
         let record_len = u16::from_be_bytes([hdr_rest[0], hdr_rest[1]]) as usize;
         let mut record_body = vec![0u8; record_len];
         if tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut record_body)).await.is_err() {
-            return;
+            return SessionStats::new();
         }
 
         let mut client_hello = vec![first_byte[0], hdr_rest[0], hdr_rest[1], hdr_rest[2], hdr_rest[3]];
@@ -472,15 +488,15 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
             Some((client_random, session_id, ts)) => {
                 debug!("[{}] Fake TLS handshake ok (ts={})", label, ts);
                 let server_hello = build_server_hello(secret, &client_random, &session_id);
-                if writer.write_all(&server_hello).await.is_err() { return; }
-                if writer.flush().await.is_err() { return; }
+                if writer.write_all(&server_hello).await.is_err() { return SessionStats::new(); }
+                if writer.flush().await.is_err() { return SessionStats::new(); }
 
                 let ft_stream = FakeTlsStream::new(reader, writer);
                 let (mut ft_reader, ft_writer) = tokio::io::split(ft_stream);
 
                 let mut hs = vec![0u8; HANDSHAKE_LEN];
                 if tokio::time::timeout(HANDSHAKE_TIMEOUT, ft_reader.read_exact(&mut hs)).await.is_err() {
-                    return;
+                    return SessionStats::new();
                 }
                 handshake = hs;
                 clt_reader = Box::new(ft_reader);
@@ -488,7 +504,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
             }
             None => {
                 debug!("[{}] Fake TLS verify failed -> masking", label);
-                return;
+                return SessionStats::new();
             }
         }
     } else if !masking.is_empty() {
@@ -505,11 +521,11 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         );
         let _ = writer.write_all(redirect.as_bytes()).await;
         let _ = writer.flush().await;
-        return;
+        return SessionStats::new();
     } else {
         let mut rest = vec![0u8; HANDSHAKE_LEN - 1];
         if tokio::time::timeout(HANDSHAKE_TIMEOUT, reader.read_exact(&mut rest)).await.is_err() {
-            return;
+            return SessionStats::new();
         }
         let mut hs = vec![first_byte[0]];
         hs.extend_from_slice(&rest);
@@ -524,7 +540,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         None => {
             STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
             warn!("[{}] bad handshake (wrong secret or proto)", label);
-            return;
+            return SessionStats::new();
         }
     };
 
@@ -560,8 +576,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
         } else {
             info!("[{}] DC{}{} WS blacklisted -> fallback", label, dc, if is_media { " media" } else { "" });
         }
-        do_fallback_tcp_ws(clt_reader, clt_writer, &relay_init, dc, &mut ctx, label).await;
-        return;
+        return do_fallback_tcp_ws(clt_reader, clt_writer, &relay_init, dc, &mut ctx, label).await;
     }
 
     let now = Instant::now();
@@ -584,7 +599,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
 
     let target = match target {
         Some(t) => t,
-        None => return,
+        None => return SessionStats::new(),
     };
 
     let mut ws = WS_POOL.get(dc, is_media, &target, &domains).await;
@@ -635,8 +650,7 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
                 info!("[{}] DC{} WS cooldown for {}s", label, dc, DC_FAIL_COOLDOWN as u32);
             }
         }
-        do_fallback_tcp_ws(clt_reader, clt_writer, &relay_init, dc, &mut ctx, label).await;
-        return;
+        return do_fallback_tcp_ws(clt_reader, clt_writer, &relay_init, dc, &mut ctx, label).await;
     }
 
     dc_fail_until().write().expect("dc_fail_until poisoned").remove(&dc_key);
@@ -645,9 +659,9 @@ async fn handle_client(stream: TcpStream, secret: &[u8], label: &str) {
     let splitter = MsgSplitter::new(&relay_init, proto_int);
     let mut ws = ws.expect("ws should be Some");
 
-    if ws.send(&relay_init).await.is_err() { return; }
+    if ws.send(&relay_init).await.is_err() { return SessionStats::new(); }
 
-    bridge_ws_reencrypt_halves(clt_reader, clt_writer, &mut ws, &mut ctx, &mut Some(splitter)).await;
+    bridge_ws_reencrypt_halves(clt_reader, clt_writer, &mut ws, &mut ctx, &mut Some(splitter)).await
 }
 
 async fn refresh_cf_domains() {
@@ -678,13 +692,13 @@ async fn do_fallback_tcp_ws(
     dc: u32,
     ctx: &mut CryptoContext,
     label: &str,
-) {
+) -> SessionStats {
     let fallback_dst = dc_default_ips().get(&dc).map(|s| s.to_string());
     let dst = match &fallback_dst {
         Some(d) => d.clone(),
         None => {
             warn!("[{}] DC{} no fallback target", label, dc);
-            return;
+            return SessionStats::new();
         }
     };
 
@@ -696,8 +710,7 @@ async fn do_fallback_tcp_ws(
                 STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
                 if ws.send(relay_init).await.is_err() { continue; }
                 let splitter = MsgSplitter::new(relay_init, PROTO_INTERMEDIATE_INT);
-                bridge_ws_reencrypt_halves(reader, writer, &mut ws, ctx, &mut Some(splitter)).await;
-                return;
+                return bridge_ws_reencrypt_halves(reader, writer, &mut ws, ctx, &mut Some(splitter)).await;
             }
         }
     }
@@ -715,8 +728,7 @@ async fn do_fallback_tcp_ws(
                     STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
                     if ws.send(relay_init).await.is_err() { continue; }
                     let splitter = MsgSplitter::new(relay_init, PROTO_INTERMEDIATE_INT);
-                    bridge_ws_reencrypt_halves(reader, writer, &mut ws, ctx, &mut Some(splitter)).await;
-                    return;
+                    return bridge_ws_reencrypt_halves(reader, writer, &mut ws, ctx, &mut Some(splitter)).await;
                 }
             }
         }
@@ -729,12 +741,13 @@ async fn do_fallback_tcp_ws(
         Ok(Ok(mut up_stream)) => {
             let _ = up_stream.set_nodelay(true);
             STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
-            if up_stream.write_all(relay_init).await.is_err() { return; }
-            if up_stream.flush().await.is_err() { return; }
+            if up_stream.write_all(relay_init).await.is_err() { return SessionStats::new(); }
+            if up_stream.flush().await.is_err() { return SessionStats::new(); }
 
             let (mut rr, mut rw) = up_stream.split();
             let mut cbuf = [0u8; 65536];
             let mut rbuf = [0u8; 65536];
+            let mut stats = SessionStats::new();
 
             loop {
                 tokio::select! {
@@ -744,6 +757,8 @@ async fn do_fallback_tcp_ws(
                             Ok(n) => n,
                         };
                         STATS.bytes_up.fetch_add(n as u64, Ordering::Relaxed);
+                        stats.bytes_up += n as u64;
+                        stats.packets_up += 1;
                         ctx.clt_dec.apply_keystream(&mut cbuf[..n]);
                         ctx.tg_enc.apply_keystream(&mut cbuf[..n]);
                         if rw.write_all(&cbuf[..n]).await.is_err() { break; }
@@ -755,6 +770,8 @@ async fn do_fallback_tcp_ws(
                             Ok(n) => n,
                         };
                         STATS.bytes_down.fetch_add(n as u64, Ordering::Relaxed);
+                        stats.bytes_down += n as u64;
+                        stats.packets_down += 1;
                         ctx.tg_dec.apply_keystream(&mut rbuf[..n]);
                         ctx.clt_enc.apply_keystream(&mut rbuf[..n]);
                         if writer.write_all(&rbuf[..n]).await.is_err() { break; }
@@ -762,8 +779,15 @@ async fn do_fallback_tcp_ws(
                     }
                 }
             }
+            stats
         }
-        Ok(Err(e)) => warn!("[{}] TCP fallback connection error: {}", label, e),
-        Err(e) => warn!("[{}] TCP fallback timeout: {}", label, e),
+        Ok(Err(e)) => {
+            warn!("[{}] TCP fallback connection error: {}", label, e);
+            SessionStats::new()
+        }
+        Err(e) => {
+            warn!("[{}] TCP fallback timeout: {}", label, e);
+            SessionStats::new()
+        }
     }
 }

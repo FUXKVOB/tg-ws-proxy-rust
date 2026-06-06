@@ -85,7 +85,7 @@ impl Stats {
     }
 }
 
-fn human_bytes(n: u64) -> String {
+pub fn human_bytes(n: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB"];
     let mut size = n as f64;
     for unit in &units {

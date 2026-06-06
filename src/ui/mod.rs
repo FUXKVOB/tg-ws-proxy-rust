@@ -20,6 +20,7 @@ pub struct GuiState {
     pub link_domain_hex: String,
     pub log_path: Option<String>,
     pub config_path: String,
+    pub version: String,
 }
 
 pub struct ProxyApp {

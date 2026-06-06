@@ -8,15 +8,24 @@ pub struct UpdateInfo {
     pub download_url: Option<String>,
 }
 
-static CACHED_LATEST: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
 static CACHED_ETAG: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
-
-fn cached_latest() -> &'static std::sync::Mutex<Option<String>> {
-    CACHED_LATEST.get_or_init(|| std::sync::Mutex::new(None))
-}
 
 fn cached_etag() -> &'static std::sync::Mutex<Option<String>> {
     CACHED_ETAG.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cache_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let dir = exe.parent().unwrap_or(std::path::Path::new("."));
+    dir.join(".update_cache")
+}
+
+fn read_cached_latest() -> Option<String> {
+    std::fs::read_to_string(cache_path()).ok().filter(|s| !s.is_empty())
+}
+
+fn write_cached_latest(ver: &str) {
+    let _ = std::fs::write(cache_path(), ver);
 }
 
 pub async fn check_for_update(current_version: &str) -> Result<UpdateInfo, Box<dyn std::error::Error + Send + Sync>> {
@@ -29,17 +38,16 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateInfo, Box<d
     let etag = cached_etag().lock().ok().and_then(|g| g.clone());
 
     let mut req = client.get(url);
-    if let Some(etag) = &etag {
+    if let Some(ref etag) = etag {
         req = req.header("If-None-Match", etag);
     }
-
     let resp = req.send().await?;
 
-    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-        let latest = cached_latest().lock().ok().and_then(|g| g.clone()).unwrap_or_default();
+    if resp.status() == 304 {
+        let cached = cached_latest().unwrap_or_default();
         return Ok(UpdateInfo {
-            has_update: false,
-            latest,
+            has_update: !cached.is_empty() && cached != current_version,
+            latest: cached,
             html_url: String::new(),
             download_url: None,
         });
@@ -58,37 +66,24 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateInfo, Box<d
         .unwrap_or("unknown")
         .trim_start_matches('v')
         .to_string();
-
-    if let Ok(mut cache) = cached_latest().lock() {
-        *cache = Some(latest.clone());
-    }
-
     let html_url = data["html_url"].as_str().unwrap_or("").to_string();
-
-    let has_update = compare_versions(&latest, current_version) > 0;
-
     let download_url = data["assets"]
         .as_array()
-        .and_then(|assets| {
-            assets.first().and_then(|a| a["browser_download_url"].as_str().map(String::from))
-        });
+        .and_then(|assets| assets.first())
+        .and_then(|a| a["browser_download_url"].as_str())
+        .map(|s| s.to_string());
+
+    write_cached_latest(&latest);
 
     Ok(UpdateInfo {
-        has_update,
+        has_update: latest != current_version,
         latest,
         html_url,
         download_url,
     })
 }
 
-fn compare_versions(a: &str, b: &str) -> i32 {
-    let a_parts: Vec<u32> = a.split('.').filter_map(|s| s.parse().ok()).collect();
-    let b_parts: Vec<u32> = b.split('.').filter_map(|s| s.parse().ok()).collect();
-    for i in 0..a_parts.len().max(b_parts.len()) {
-        let av = a_parts.get(i).copied().unwrap_or(0);
-        let bv = b_parts.get(i).copied().unwrap_or(0);
-        if av > bv { return 1; }
-        if av < bv { return -1; }
-    }
-    0
+fn cached_latest() -> Option<String> {
+    let cached = read_cached_latest();
+    if cached.as_ref().is_some_and(|s| !s.is_empty()) { cached } else { None }
 }
