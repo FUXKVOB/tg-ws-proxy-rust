@@ -27,10 +27,35 @@ impl Default for SessionStats {
     }
 }
 
+pub trait WsTransport {
+    fn send(&mut self, data: &[u8]) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
+    fn send_batch(&mut self, parts: &[Vec<u8>]) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send;
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>>> + Send;
+    fn close(&mut self) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl WsTransport for RawWebSocket {
+    async fn send(&mut self, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send(data).await
+    }
+
+    async fn send_batch(&mut self, parts: &[Vec<u8>]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send_batch(parts).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.recv().await
+    }
+
+    async fn close(&mut self) {
+        self.close().await
+    }
+}
+
 pub async fn bridge_ws_reencrypt_halves<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
     mut writer: W,
-    ws: &mut RawWebSocket,
+    ws: &mut impl WsTransport,
     ctx: &mut CryptoContext,
     splitter: &mut Option<MsgSplitter>,
 ) -> SessionStats {

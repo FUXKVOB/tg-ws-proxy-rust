@@ -1,0 +1,79 @@
+name: Build && Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: [x86_64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tg-ws-proxy-${{ matrix.target }}
+          path: target/release/tg-ws-proxy.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tg-ws-proxy-x86_64-pc-windows-msvc
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tg-ws-proxy.exe
+          body: |
+            ## tg-ws-proxy ${{ github.ref_name }}
+
+            Скачайте `tg-ws-proxy.exe` и запустите.
+
+            ```bash
+            tg-ws-proxy --secret <ваш-секрет>
+            ```
+
+            Полный список параметров: `tg-ws-proxy --help`
