@@ -3,23 +3,22 @@
 **Telegram MTProto WebSocket Bridge Proxy** — прокси для Telegram Desktop,
 конвертирующий MTProto поверх TCP в MTProto поверх WebSocket.
 
-Форк оригинального проекта [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy),
-переписанный с Python на Rust.
+Основан на [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy),
+с критическими участками, переписанными на Rust (PyO3) для производительности.
 
 ## Возможности
 
-- Проксирование MTProto через WebSocket (RFC 6455) — без внешних WS-библиотек
+- Проксирование MTProto через WebSocket (RFC 6455)
 - Поддержка Fake TLS — маскировка под HTTPS-трафик
 - Поддержка PROXY protocol v1
-- Obfuscated MTProto handshake (как в MTProx)
-- CF Worker / Cloudflare Proxy fallback chain
+- Obfuscated MTProto handshake (Abridged / Intermediate / Padded Intermediate)
+- CF Worker / Cloudflare Proxy / TCP fallback chain
 - Автоматическое обновление списка доменов Cloudflare
 - Blacklist DC при недоступности
 - Балансировка по пулу WebSocket-соединений
-- Автоматическая проверка обновлений с GitHub
-- Per-session статистика
-- GUI окно (egui) через иконку в системном трее
-- Graceful shutdown по Ctrl+C
+- Rust-ускорение: XOR-маскировка + MsgSplitter (AES-CTR + MTProto packet splitter)
+- Tray UI (Windows / macOS / Linux)
+- Graceful shutdown
 
 ## Использование
 
@@ -27,40 +26,48 @@
 tg-ws-proxy [OPTIONS]
 ```
 
-### Параметры
-
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
 | `--port` | `1443` | Порт для входящих подключений |
 | `--host` | `127.0.0.1` | Интерфейс для прослушивания |
 | `--secret` | — | Secret-ключ (hex) для MTProto |
 | `--dc-ip` | — | Принудительный IP для DC (например `2:1.2.3.4`) |
-| `--config` | — | Путь к TOML-конфигу |
-
-### Config file (`config.toml`)
-
-```toml
-host = "0.0.0.0"
-port = 1443
-secret = "ee"  # hex-encoded secret
-```
+| `--fake-tls-domain` | — | Домен для Fake TLS (ee-secret) |
+| `--cfproxy-domain` | — | Пользовательский CF-домен |
+| `--cfproxy-worker-domain` | — | Cloudflare Worker домен |
+| `--pool-size` | `4` | Размер пула WS-соединений |
+| `--buf-kb` | `256` | Буфер сокета (KB) |
+| `--proxy-protocol` | — | PROXY protocol v1 |
+| `--shutdown-timeout` | `10` | Таймаут graceful shutdown (сек) |
 
 ## Сборка
 
 ```bash
-cargo build --release
+# Python + Rust (PyO3) — требуется Rust toolchain + Python 3.11+
+pip install maturin
+maturin develop --release
+pip install .
 ```
 
-Бинарник будет в `target/release/tg-ws-proxy.exe`.
+Бинарный файл собирается через PyInstaller:
+```bash
+pyinstaller packaging/windows.spec --noconfirm
+```
+
+## Rust-компоненты
+
+| Модуль | Назначение |
+|--------|-----------|
+| `xor_mask` | XOR-маскировка WebSocket фреймов (RFC 6455) — SIMD через u32 |
+| `MsgSplitter` | AES-256-CTR дешифровка + разбор MTProto пакетов (Abridged/Intermediate/Padded) |
 
 ## Зависимости
 
-- Rust edition 2024
-- Tokio (асинхронный рантайм)
-- eframe/egui (GUI)
-- tokio-native-tls (TLS)
-- Реализация WebSocket, Fake TLS и MTProto — собственная, без внешних библиотек
+- Python 3.11+
+- Rust edition 2024 (PyO3)
+- Tokio не используется — asyncio (Python)
+- GUI: CustomTkinter / rumps / pystray
 
 ## Лицензия
 
-MIT — как и оригинал.
+MIT
